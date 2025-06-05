@@ -1,107 +1,97 @@
 import socket
-import zlib
-import pickle
-import pygame
-import io
 import threading
-import pyaudio
+import pickle
+import zlib
+from PIL import Image, ImageTk
+import io
+import tkinter as tk
 
-SERVER_IP = 'YOUR_SERVER_IP'  # Replace with your server's IP
+SERVER_IP = '127.0.0.1'  # replace with your actual server IP
 PORT_SCREEN = 9999
-PORT_AUDIO = 9998
+PASSWORD = "mysecret123"
 
-# --- Connect to Screen/Input Server ---
 client_screen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 client_screen.connect((SERVER_IP, PORT_SCREEN))
 
-# --- Authenticate ---
-msg = client_screen.recv(1024).decode()
-if msg == "PASSWORD:":
-    client_screen.sendall(input("Password: ").encode())
-    response = client_screen.recv(1024).decode()
-    if response != "ACCESS GRANTED":
-        print("Access denied by server.")
-        client_screen.close()
+# Authentication
+if client_screen.recv(1024) == b"PASSWORD:":
+    client_screen.sendall(PASSWORD.encode())
+    if client_screen.recv(1024) != b"ACCESS GRANTED":
+        print("Access denied.")
         exit()
-    else:
-        print("Access granted.")
 
-# --- Connect to Audio Server ---
-client_audio = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-client_audio.connect((SERVER_IP, PORT_AUDIO))
+# Get server's resolution
+server_resolution = pickle.loads(client_screen.recv(4096))
+original_width = server_resolution['width']
+original_height = server_resolution['height']
 
-# --- Receive screen resolution ---
-screen_info = pickle.loads(client_screen.recv(1024))
-screen_w, screen_h = screen_info['width'], screen_info['height']
-window = pygame.display.set_mode((screen_w, screen_h))
-pygame.display.set_caption("Remote Screen Viewer")
+# Tkinter setup
+root = tk.Tk()
+root.title("Remote Viewer")
 
-# --- Audio Playback Setup ---
-p = pyaudio.PyAudio()
-audio_stream = p.open(format=pyaudio.paInt16, channels=1, rate=44100, output=True, frames_per_buffer=1024)
+# Choose desired scale (e.g. 0.6 = 60% of real screen)
+SCALE = 0.6
+canvas_width = int(original_width * SCALE)
+canvas_height = int(original_height * SCALE)
 
-def receive_audio():
-    while True:
-        try:
-            length_bytes = client_audio.recv(4)
-            if not length_bytes:
-                break
-            length = int.from_bytes(length_bytes, 'big')
-            data = client_audio.recv(length)
-            audio = zlib.decompress(data)
-            audio_stream.write(audio)
-        except Exception as e:
-            print("Audio error:", e)
-            break
-
-def send_input(event):
-    if event.type == pygame.MOUSEMOTION:
-        x, y = pygame.mouse.get_pos()
-        command = {'type': 'move', 'x': x, 'y': y}
-    elif event.type == pygame.MOUSEBUTTONDOWN:
-        command = {'type': 'click'}
-    elif event.type == pygame.KEYDOWN:
-        key = pygame.key.name(event.key)
-        command = {'type': 'keypress', 'key': key}
-    else:
-        return
-    try:
-        client_screen.sendall(zlib.compress(pickle.dumps(command)))
-    except Exception as e:
-        print("Input send error:", e)
+canvas = tk.Canvas(root, width=canvas_width, height=canvas_height)
+canvas.pack()
+img_on_canvas = None  # image reference
 
 def receive_screen():
+    global img_on_canvas
     while True:
         try:
-            length_bytes = client_screen.recv(4)
-            if not length_bytes:
+            size_bytes = client_screen.recv(4)
+            if not size_bytes:
                 break
-            length = int.from_bytes(length_bytes, 'big')
+            frame_len = int.from_bytes(size_bytes, 'big')
+
             data = b''
-            while len(data) < length:
-                packet = client_screen.recv(length - len(data))
+            while len(data) < frame_len:
+                packet = client_screen.recv(min(4096, frame_len - len(data)))
                 if not packet:
                     return
                 data += packet
-            img_data = zlib.decompress(data)
-            img = pygame.image.load(io.BytesIO(img_data)).convert()
-            window.blit(pygame.transform.scale(img, (screen_w, screen_h)), (0, 0))
-            pygame.display.flip()
+
+            frame = zlib.decompress(data)
+            image = Image.open(io.BytesIO(frame))
+
+            image = image.resize((canvas_width, canvas_height))
+            image_tk = ImageTk.PhotoImage(image)
+
+            if img_on_canvas is None:
+                img_on_canvas = canvas.create_image(0, 0, anchor='nw', image=image_tk)
+            else:
+                canvas.itemconfig(img_on_canvas, image=image_tk)
+
+            canvas.image = image_tk  # avoid garbage collection
         except Exception as e:
             print("Screen error:", e)
             break
 
-# --- Start Threads ---
-threading.Thread(target=receive_audio, daemon=True).start()
+def send_input(cmd):
+    try:
+        payload = zlib.compress(pickle.dumps(cmd))
+        client_screen.sendall(payload)
+    except Exception as e:
+        print("Send input error:", e)
+
+def mouse_move(event):
+    scale_x = original_width / canvas.winfo_width()
+    scale_y = original_height / canvas.winfo_height()
+    send_input({'type': 'move', 'x': int(event.x * scale_x), 'y': int(event.y * scale_y)})
+
+def mouse_click(event):
+    send_input({'type': 'click'})
+
+def key_press(event):
+    send_input({'type': 'keypress', 'key': event.keysym})
+
+canvas.bind("<Motion>", mouse_move)
+canvas.bind("<Button-1>", mouse_click)
+root.bind("<Key>", key_press)
+
 threading.Thread(target=receive_screen, daemon=True).start()
 
-# --- Main Event Loop ---
-pygame.init()
-while True:
-    for event in pygame.event.get():
-        if event.type == pygame.QUIT:
-            client_screen.close()
-            client_audio.close()
-            pygame.quit()
-            exit()
-        send_input(event)
+root.mainloop()
