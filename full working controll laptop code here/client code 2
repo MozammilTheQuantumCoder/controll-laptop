@@ -1,0 +1,137 @@
+import socket
+import zlib
+import pickle
+import pygame
+import io
+import threading
+import pyaudio
+import sys
+
+SERVER_IP = 'YOUR_SERVER_IP'  # Replace with your server's IP
+PORT_SCREEN = 9999
+PORT_AUDIO = 9998
+PASSWORD = "mysecret123"
+
+# --- Connect to Screen/Input Server ---
+client_screen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+client_screen.connect((SERVER_IP, PORT_SCREEN))
+
+# --- Authenticate ---
+msg = client_screen.recv(1024).decode()
+if msg == "PASSWORD:":
+    client_screen.sendall(PASSWORD.encode())
+    response = client_screen.recv(1024).decode()
+    if response != "ACCESS GRANTED":
+        print("Access denied by server.")
+        client_screen.close()
+        sys.exit()
+    else:
+        print("Access granted.")
+
+# --- Connect to Audio Server ---
+client_audio = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+client_audio.connect((SERVER_IP, PORT_AUDIO))
+
+# --- Receive server screen resolution ---
+screen_info = pickle.loads(client_screen.recv(1024))
+server_w, server_h = screen_info['width'], screen_info['height']
+
+# --- Initialize Pygame ---
+pygame.init()
+pygame.display.set_caption("Remote Desktop Viewer")
+flags = pygame.RESIZABLE
+window = pygame.display.set_mode((server_w, server_h), flags)
+
+is_fullscreen = False
+
+def toggle_fullscreen():
+    global is_fullscreen, window
+    is_fullscreen = not is_fullscreen
+    if is_fullscreen:
+        window = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+    else:
+        window = pygame.display.set_mode((server_w, server_h), pygame.RESIZABLE)
+
+# --- Audio Setup ---
+p = pyaudio.PyAudio()
+audio_stream = p.open(format=pyaudio.paInt16, channels=1, rate=44100, output=True, frames_per_buffer=1024)
+
+# --- Calculate scaling ---
+def get_scale():
+    win_w, win_h = window.get_size()
+    return server_w / win_w, server_h / win_h
+
+def receive_audio():
+    while True:
+        try:
+            length_bytes = client_audio.recv(4)
+            if not length_bytes:
+                break
+            length = int.from_bytes(length_bytes, 'big')
+            data = b''
+            while len(data) < length:
+                packet = client_audio.recv(length - len(data))
+                if not packet: return
+                data += packet
+            audio = zlib.decompress(data)
+            audio_stream.write(audio)
+        except Exception as e:
+            print("Audio error:", e)
+            break
+
+def send_input(event):
+    scale_x, scale_y = get_scale()
+    if event.type == pygame.MOUSEMOTION:
+        x, y = pygame.mouse.get_pos()
+        command = {'type': 'move', 'x': int(x * scale_x), 'y': int(y * scale_y)}
+    elif event.type == pygame.MOUSEBUTTONDOWN:
+        command = {'type': 'click'}
+    elif event.type == pygame.KEYDOWN:
+        if event.key == pygame.K_F11:
+            toggle_fullscreen()
+            return
+        key = pygame.key.name(event.key)
+        command = {'type': 'keypress', 'key': key}
+    else:
+        return
+
+    try:
+        client_screen.sendall(zlib.compress(pickle.dumps(command)))
+    except Exception as e:
+        print("Input send error:", e)
+
+def receive_screen():
+    while True:
+        try:
+            length_bytes = client_screen.recv(4)
+            if not length_bytes:
+                break
+            length = int.from_bytes(length_bytes, 'big')
+            data = b''
+            while len(data) < length:
+                packet = client_screen.recv(length - len(data))
+                if not packet: return
+                data += packet
+            img_data = zlib.decompress(data)
+            img = pygame.image.load(io.BytesIO(img_data)).convert()
+            window_w, window_h = window.get_size()
+            img_scaled = pygame.transform.scale(img, (window_w, window_h))
+            window.blit(img_scaled, (0, 0))
+            pygame.display.flip()
+        except Exception as e:
+            print("Screen error:", e)
+            break
+
+# --- Start Threads ---
+threading.Thread(target=receive_audio, daemon=True).start()
+threading.Thread(target=receive_screen, daemon=True).start()
+
+# --- Main Event Loop ---
+while True:
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            client_screen.close()
+            client_audio.close()
+            pygame.quit()
+            sys.exit()
+        send_input(event)
